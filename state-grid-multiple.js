@@ -1,18 +1,42 @@
 /******************************************
  * 多电表版-网上国网🌏 
  *****************************************
- 修改适配homeassistant，通过mqtt发送消息至homeassistant
+ 【项目概述】
+ 这是一个用于获取国家电网电力数据的脚本，主要功能：
+ 1. 登录网上国网APP，获取用户绑定的电表信息
+ 2. 查询电费余额、日用电量、月用电量等数据
+ 3. 通过MQTT将数据推送到Home Assistant
+ 4. 支持独立运行和青龙面板两种模式
+ 5. 支持Token缓存，避免频繁登录
+ 6. 支持历史数据本地存储
+ 
+ 【运行模式】
+ - 独立运行：使用 config.env 配置文件，通过 npm start 运行
+ - 青龙面板：使用青龙环境变量，通过定时任务运行
+ 
+ 【数据流向】
+ 网上国网API → 脚本处理 → MQTT推送 → Home Assistant → 前端展示
+ 
  *****************************************
- 环境变量设置
- export WSGW_USERNAME="" #网上国网账号
- export WSGW_PASSWORD="" #网上国网密码
- export WSGW_RECENT_ELC_FEE="true" #是否获取最近电费
- export WSGW_mqtt_host="" #mqtt服务器地址 192.168.1.7
- export WSGW_mqtt_port="" #mqtt服务器端口 1883
- export WSGW_mqtt_username="" #mqtt服务器用户名
- export WSGW_mqtt_password="" #mqtt服务器密码
+ 环境变量设置（独立运行时使用 config.env 文件）:
+ WSGW_USERNAME="" #网上国网账号
+ WSGW_PASSWORD="" #网上国网密码
+ WSGW_RECENT_ELC_FEE="true" #是否获取最近电费
+ MQTT_ENABLED="true" #是否启用MQTT推送
+ WSGW_mqtt_host="" #mqtt服务器地址
+ WSGW_mqtt_port="" #mqtt服务器端口
+ WSGW_mqtt_username="" #mqtt服务器用户名
+ WSGW_mqtt_password="" #mqtt服务器密码
+ DATA_STORE_DIR="" #数据存储目录
+ SAVE_HISTORY_DATA="true" #是否保存历史数据
+ HISTORY_RETENTION_DAYS=365 #历史数据保留天数
+ TOKEN_CACHE_HOURS=24 #Token缓存有效期（小时）
+ QUERY_DAYS=7 #日用电量查询天数
+ QUERY_START_DATE="" #自定义开始日期（YYYY-MM-DD）
+ QUERY_END_DATE="" #自定义结束日期（YYYY-MM-DD）
+ QUERY_CONS_NO="" #指定查询的用电户号（多个用逗号分隔）
  *****************************************
- * mqtt订阅主题：nodejs/state-grid/{用电户号}
+ mqtt订阅主题：nodejs/state-grid/{用电户号}
  *****************************************
  脚本声明:
  1. 本脚本仅用于学习研究，禁止用于商业用途
@@ -25,7 +49,56 @@
  *****************************************
  * 原作者 𝒀𝒖𝒉𝒆𝒏𝒈 https://github.com/Yuheng0101/X
  ******************************************/
- const getEnv = () =>
+
+/******************************************
+ * 第一部分：基础模块导入和环境检测
+ ******************************************/
+
+const fs = require('fs');
+const path = require('path');
+
+/**
+ * 检测是否在青龙面板环境中运行
+ * 青龙面板会设置 QL_DIR 或 QL_BRANCH 环境变量，或者存在 /ql 目录
+ */
+const isQinglong = process.env.QL_DIR || process.env.QL_BRANCH || fs.existsSync('/ql');
+
+/**
+ * 环境变量加载逻辑
+ * - 青龙面板：直接使用青龙设置的环境变量
+ * - 独立运行：从 config.env 文件加载环境变量
+ */
+if (!isQinglong) {
+  try {
+    const dotenv = require('dotenv');
+    const envPath = path.join(__dirname, 'config.env');
+    if (fs.existsSync(envPath)) {
+      dotenv.config({ path: envPath });
+      console.log('✅ 已加载 config.env 配置文件');
+    } else {
+      const examplePath = path.join(__dirname, 'config.env.example');
+      if (fs.existsSync(examplePath)) {
+        console.log('⚠️ 未找到 config.env，请复制 config.env.example 并配置');
+      }
+    }
+  } catch (e) {
+    console.log('⚠️ dotenv 模块未安装，使用环境变量');
+  }
+}
+
+/******************************************
+ * 第二部分：运行环境检测工具函数
+ * 
+ * 这部分代码用于检测脚本运行在哪种环境中
+ * 支持多种代理工具：Surge、Loon、Stash、Quantumult X、Shadowrocket
+ * 本项目主要使用 Node.js 环境
+ ******************************************/
+
+/**
+ * 获取当前运行环境类型
+ * @returns {string} 环境名称：Surge/Loon/Stash/Node.js/Quantumult X/Shadowrocket
+ */
+const getEnv = () =>
   'undefined' != typeof $environment && $environment['surge-version']
     ? 'Surge'
     : 'undefined' != typeof $environment && $environment['stash-version']
@@ -43,6 +116,13 @@
   isLoon = () => 'Loon' === getEnv(),
   isStash = () => 'Stash' === getEnv(),
   isNode = () => 'Node.js' === getEnv();
+
+/******************************************
+ * 第三部分：日志工具类
+ * 
+ * 提供分级日志输出功能，支持 trace/debug/info/warn/error 五个级别
+ ******************************************/
+
 class Logger {
   constructor(e = '日志输出', o = 'info') {
     (this.prefix = e),
@@ -75,6 +155,14 @@ class Logger {
     this.log('error', ...e);
   }
 }
+
+/******************************************
+ * 第四部分：HTTP请求封装
+ * 
+ * 统一的HTTP请求方法，适配多种运行环境
+ * 在Node.js环境中使用 got 库发送请求
+ ******************************************/
+
 const request$1 = async (request = {} || '', option = {}) => {
   switch (request.constructor) {
     case Object:
@@ -181,6 +269,15 @@ const request$1 = async (request = {} || '', option = {}) => {
       );
   }
 };
+
+/******************************************
+ * 第五部分：本地存储类
+ * 
+ * 用于持久化存储数据，如Token、用户信息等
+ * 在Node.js环境中使用 node-localstorage 模拟浏览器 localStorage
+ * 数据存储在 data/ONZ3V/ 目录下
+ ******************************************/
+
 class Store {
   constructor(NAMESPACE) {
     if (
@@ -189,10 +286,15 @@ class Store {
         NAMESPACE && (this.Store = `./store/${NAMESPACE}`),
         'Node.js' === this.env)
     ) {
+      const dataDir = process.env.DATA_STORE_DIR || './data';
+      const storePath = NAMESPACE ? path.join(dataDir, NAMESPACE) : dataDir;
+      if (!fs.existsSync(storePath)) {
+        fs.mkdirSync(storePath, { recursive: true });
+      }
       const { LocalStorage: LocalStorage } = eval(
         'require("node-localstorage")'
       );
-      this.localStorage = new LocalStorage(this.Store);
+      this.localStorage = new LocalStorage(storePath);
     }
   }
   get(e) {
@@ -241,121 +343,119 @@ class Store {
     }
   }
 }
-const notify = (e = '', o = '', r = '', s = {}) => {
-  const n = e => {
-    const { $open: o, $copy: r, $media: s, $mediaMime: n } = e;
-    switch (typeof e) {
-      case void 0:
-        return e;
-      case 'string':
-        switch (getEnv()) {
-          case 'Surge':
-          case 'Stash':
-          default:
-            return { url: e };
-          case 'Loon':
-          case 'Shadowrocket':
-            return e;
-          case 'Quantumult X':
-            return { 'open-url': e };
-          case 'Node.js':
-            return;
-        }
-      case 'object':
-        switch (getEnv()) {
-          case 'Surge':
-          case 'Stash':
-          case 'Shadowrocket':
-          default: {
-            const t = {};
-            let c = e.openUrl || e.url || e['open-url'] || o;
-            c && Object.assign(t, { action: 'open-url', url: c });
-            let a = e['update-pasteboard'] || e.updatePasteboard || r;
-            if (
-              (a && Object.assign(t, { action: 'clipboard', text: a }), s)
-            ) {
-              let e, o, r;
-              if (s.startsWith('http')) e = s;
-              else if (s.startsWith('data:')) {
-                const [e] = s.split(';'),
-                  [, n] = s.split(',');
-                (o = n), (r = e.replace('data:', ''));
-              } else {
-                (o = s),
-                  (r = (e => {
-                    const o = {
-                      JVBERi0: 'application/pdf',
-                      R0lGODdh: 'image/gif',
-                      R0lGODlh: 'image/gif',
-                      iVBORw0KGgo: 'image/png',
-                      '/9j/': 'image/jpg',
-                    };
-                    for (var r in o) if (0 === e.indexOf(r)) return o[r];
-                    return null;
-                  })(s));
-              }
-              Object.assign(t, {
-                'media-url': e,
-                'media-base64': o,
-                'media-base64-mime': n ?? r,
-              });
-            }
-            return (
-              Object.assign(t, {
-                'auto-dismiss': e['auto-dismiss'],
-                sound: e.sound,
-              }),
-              t
-            );
-          }
-          case 'Loon': {
-            const r = {};
-            let n = e.openUrl || e.url || e['open-url'] || o;
-            n && Object.assign(r, { openUrl: n });
-            let t = e.mediaUrl || e['media-url'];
-            return (
-              s?.startsWith('http') && (t = s),
-              t && Object.assign(r, { mediaUrl: t }),
-              console.log(JSON.stringify(r)),
-              r
-            );
-          }
-          case 'Quantumult X': {
-            const n = {};
-            let t = e['open-url'] || e.url || e.openUrl || o;
-            t && Object.assign(n, { 'open-url': t });
-            let c = e['media-url'] || e.mediaUrl;
-            s?.startsWith('http') && (c = s),
-              c && Object.assign(n, { 'media-url': c });
-            let a = e['update-pasteboard'] || e.updatePasteboard || r;
-            return (
-              a && Object.assign(n, { 'update-pasteboard': a }),
-              console.log(JSON.stringify(n)),
-              n
-            );
-          }
-          case 'Node.js':
-            return;
-        }
-      default:
-        return;
+
+/******************************************
+ * 第六部分：历史数据管理类
+ * 
+ * 用于管理用电历史数据的持久化存储
+ * - 将每日用电数据保存到本地JSON文件
+ * - 支持数据去重和过期数据清理
+ * - 解决了国网API只返回7天数据的限制
+ ******************************************/
+
+class HistoryDataManager {
+  constructor() {
+    this.dataDir = process.env.DATA_STORE_DIR || path.join(__dirname, 'data');
+    this.historyFile = path.join(this.dataDir, 'history_data.json');
+    this.retentionDays = parseInt(process.env.HISTORY_RETENTION_DAYS) || 365;
+    this.saveEnabled = process.env.SAVE_HISTORY_DATA !== 'false';
+
+    if (!fs.existsSync(this.dataDir)) {
+      fs.mkdirSync(this.dataDir, { recursive: true });
     }
-  };
-  switch (getEnv()) {
-    case 'Surge':
-    case 'Loon':
-    case 'Stash':
-    case 'Shadowrocket':
-    default:
-      $notification.post(e, o, r, n(s));
-      break;
-    case 'Quantumult X':
-      $notify(e, o, r, n(s));
-    case 'Node.js':
   }
+
+  /**
+   * 从文件加载历史数据
+   * @returns {Object} 包含 dayList 和 monthList 的历史数据对象
+   */
+  load() {
+    try {
+      if (fs.existsSync(this.historyFile)) {
+        const content = fs.readFileSync(this.historyFile, 'utf-8');
+        return JSON.parse(content);
+      }
+    } catch (e) {
+      console.log('⚠️ 加载历史数据失败:', e.message);
+    }
+    return { dayList: {}, monthList: {} };
+  }
+
+  /**
+   * 保存用电数据到历史记录
+   * @param {Object} data - 包含 dayList 和 monthList 的数据对象
+   * @param {string} consNo - 用电户号，作为数据索引
+   * 
+   * 功能说明：
+   * 1. 合并新旧数据，避免重复
+   * 2. 按日期排序
+   * 3. 清理超过保留天数的数据
+   */
+  save(data, consNo) {
+    if (!this.saveEnabled) return;
+
+    try {
+      const history = this.load();
+
+      if (!history.dayList[consNo]) {
+        history.dayList[consNo] = [];
+      }
+
+      const existingDays = new Set(history.dayList[consNo].map(d => d.day));
+      for (const dayData of data.dayList || []) {
+        if (!existingDays.has(dayData.day)) {
+          history.dayList[consNo].push(dayData);
+          existingDays.add(dayData.day);
+        }
+      }
+
+      history.dayList[consNo].sort((a, b) => a.day.localeCompare(b.day));
+
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - this.retentionDays);
+      const cutoffStr = cutoffDate.toISOString().split('T')[0];
+      history.dayList[consNo] = history.dayList[consNo].filter(d => d.day >= cutoffStr);
+
+      history.monthList[consNo] = data.monthList || [];
+      history.lastUpdate = new Date().toISOString();
+      history.lastUpdateConsNo = consNo;
+
+      fs.writeFileSync(this.historyFile, JSON.stringify(history, null, 2));
+      console.log(`✅ 历史数据已保存，共 ${history.dayList[consNo].length} 条日用电记录`);
+    } catch (e) {
+      console.log('⚠️ 保存历史数据失败:', e.message);
+    }
+  }
+
+  /**
+   * 获取指定户号的历史数据
+   * @param {string} consNo - 用电户号
+   * @returns {Object} 该户号的历史数据
+   */
+  getHistory(consNo) {
+    const history = this.load();
+    return {
+      dayList: history.dayList[consNo] || [],
+      monthList: history.monthList[consNo] || []
+    };
+  }
+}
+
+/******************************************
+ * 第七部分：工具函数
+ ******************************************/
+
+/**
+ * 通知函数（简化版，仅输出到控制台）
+ */
+const notify = (e = '', o = '', r = '', s = {}) => {
   let t = ['', '==============📣系统通知📣=============='];
   t.push(e), o && t.push(o), r && t.push(r), console.log(t.join('\n'));
 },
+  /**
+   * 脚本结束函数
+   * 根据运行环境执行不同的退出逻辑
+   */
   done = (e = {}) => {
     switch (getEnv()) {
       case 'Surge':
@@ -367,11 +467,33 @@ const notify = (e = '', o = '', r = '', s = {}) => {
         $done(e);
         break;
       case 'Node.js':
-        process.exit(1);
+        process.exit(0);
     }
   },
+  /**
+   * 中转服务器地址
+   * 用于加密/解密网上国网API请求
+   * 为什么需要中转服务器？
+   * - 网上国网API使用了复杂的加密算法
+   * - 中转服务器负责处理加密/解密，简化本地脚本逻辑
+   */
   SERVER_HOST = 'https://api.120399.xyz',
+  /**
+   * 网上国网官方API地址
+   */
   BASE_URL = 'https://www.95598.cn',
+  /**
+   * 核心请求函数
+   * 
+   * 工作流程：
+   * 1. 将请求数据发送到中转服务器进行加密
+   * 2. 使用加密后的数据请求网上国网API
+   * 3. 将响应数据发送到中转服务器进行解密
+   * 4. 返回解密后的数据
+   * 
+   * @param {Object} e - 请求配置对象
+   * @returns {Promise} 解密后的API响应数据
+   */
   request = async e => {
     try {
       const o = {
@@ -413,6 +535,10 @@ const notify = (e = '', o = '', r = '', s = {}) => {
       return Promise.reject(e);
     }
   },
+  /**
+   * 加密函数
+   * 调用中转服务器对请求进行加密
+   */
   Encrypt = async e =>
     request$1(e).then(({ body: e }) => {
       try {
@@ -425,6 +551,10 @@ const notify = (e = '', o = '', r = '', s = {}) => {
         e.data
       );
     }),
+  /**
+   * 解密函数
+   * 调用中转服务器对响应进行解密
+   */
   Decrypt = async e =>
     request$1(e).then(({ body: o }) => {
       let r = JSON.parse(o);
@@ -447,6 +577,10 @@ const notify = (e = '', o = '', r = '', s = {}) => {
           ? Promise.reject(`重新获取: ${n}`)
           : Promise.reject(n);
     }),
+  /**
+   * 验证码识别函数
+   * 调用中转服务器识别滑块验证码
+   */
   Recoginze = async e => {
     const o = {
       url: `${SERVER_HOST}/wsgw/get_x`,
@@ -455,6 +589,11 @@ const notify = (e = '', o = '', r = '', s = {}) => {
     };
     return request$1(o).then(({ body: e }) => JSON.parse(e));
   },
+  /**
+   * 获取指定天数前的日期字符串
+   * @param {number} e - 天数
+   * @returns {string} 格式为 YYYY-MM-DD 的日期字符串
+   */
   getBeforeDate = e => {
     const o = new Date();
     o.setDate(o.getDate() - e);
@@ -463,6 +602,9 @@ const notify = (e = '', o = '', r = '', s = {}) => {
       '0'
     )}-${String(o.getDate()).padStart(2, '0')}`;
   },
+  /**
+   * JSON解析函数（带容错）
+   */
   jsonParse = e => {
     try {
       return JSON.parse(e);
@@ -470,6 +612,9 @@ const notify = (e = '', o = '', r = '', s = {}) => {
       return e;
     }
   },
+  /**
+   * JSON字符串化函数（带容错）
+   */
   jsonStr = (e, ...o) => {
     if ('string' == typeof e) return e;
     try {
@@ -478,850 +623,189 @@ const notify = (e = '', o = '', r = '', s = {}) => {
       return e;
     }
   },
-  isTrue = e => !0 === e || 'true' === e || 1 === e || '1' === e,
-  $api = {
-    getKeyCode: '/oauth2/outer/c02/f02',
-    getAuth: '/oauth2/oauth/authorize',
-    getWebToken: '/oauth2/outer/getWebToken',
-    getRoutes: '/osg-web0004/open/c7/f01',
-    searchMenu: '/osg-web0004/open/c2/f02',
-    contentSearch: '/osg-web0004/open/c4/f05',
-    shouyequery: '/osg-web0004/member/c4/f08',
-    seachOrgNo: '/osg-open-om0001/member/c13/f05',
-    detailpcut: '/osg-open-mce0001/member/c4/f06',
-    login: '/osg-open-uc0001/member/c8/f23',
-    loginout: '/osg-open-uc0001/member/c8/f2311111',
-    tokenlogin: '/osg-open-uc0001/member/c8/f01',
-    seachMsgEs: '/osg-web0004/open/c4/f03',
-    orderEmail: '/osg-open-bc0001/member/c02/f04',
-    LowelectBill: '/osg-open-bc0001/member/c04/f01',
-    HideelectBill: '/osg-open-bc0001/member/c04/f02',
-    quantity: '/osg-open-bc0001/member/c01/f01',
-    searchProgress: '/osg-open-uc0001/member/c6/f06',
-    Urge: '/osg-open-woc0001/member/c5/f06',
-    fileLists: '/osg-open-woc0001/member/c27/f01',
-    fileLists2: '/osg-open-woc0001/member/c5/f07',
-    fileLists3: '/osg-open-woc0001/member/c5/f08',
-    realType: '/osg-open-uc0001/member/c7/f01',
-    paymentRecord: '/osg-open-bc0001/member/c03/f12',
-    power: '/osg-omgmt0005/member/c9/f30',
-    accountInfo: '/osg-open-uc0001/member/c4/f01',
-    address: '/osg-open-om0001/member/c72/f01',
-    CheckBillAmount: '/osg-open-bc0001/member/c03/f07',
-    vatname: '/osg-open-uc0001/member/c4/f02',
-    fgd_Submit: '/osg-open-woc0001/member/c4/f09',
-    fgd_appraise: '/osg-open-woc0001/member/c27/f07',
-    shouye: '/osg-web0004/open/c1/f01',
-    captcha: '/osg-web0004/open/c15/f01',
-    login: '/osg-open-uc0001/member/c8/f23',
-    captchaPassword: '/osg-web0004/open/c15/f03',
-    getCode2: '/osg-web0004/open/c50/f02',
-    getCode: '/osg-open-uc0001/member/c8/f24',
-    clickCard: '/osg-web0004/open/c44/f07',
-    useTokenGetInfo: '/osg-uc0013/member/c4/f04',
-    tokenGetUserInfo: '/osg-open-uc0001/member/c8/f56',
-    getQCodeNew: '/osg-open-uc0001/member/c8/f31',
-    checkQCode: '/osg-open-uc0001/member/c8/f32',
-    qcodeCallback: '/osg-open-uc0001/member/c8/f33',
-    content: '/osg-web0004/open/c4/f01',
-    menu: '/osg-web0004/open/c2/f01',
-    indexPage: '/osg-web0004/open/c1/f01',
-    newsList: '/osg-open-mce0001/member/c4/f01',
-    delMsg: '/osg-open-mce0001/member/c4/f05',
-    codeLogin: '/osg-open-uc0001/member/c8/f22',
-    codeLoginApi: '/osg-uc0013/member/c4/f02',
-    reg: '/osg-open-uc0001/member/c8/f25',
-    dianfeiList: '/osg-open-bc0001/member/c01/f02',
-    changePassword: '/osg-open-uc0001/member/c8/f06',
-    Presubmission: '/osg-open-woc0001/member/c4/f03',
-    messageList: '/osg-open-uc0001/member/c13/f01',
-    newMessageList: '/osg-web0004/member/c15/f06',
-    forgetPass: '/osg-open-uc0001/member/c8/f06',
-    sendCode: '/osg-open-uc0001/member/c8/f04',
-    checkCode: '/osg-open-uc0001/member/c8/f05',
-    resetPass: '/osg-open-uc0001/member/c8/f07',
-    submitHouse: '/osg-open-uc0001/member/c5/f04',
-    bindholds: '/osg-open-uc0001/member/c14/f02',
-    getBindDoorCity: '/osg-open-om0001/member/arg/020390006',
-    hadList: '/osg-open-uc0001/member/c9/f02',
-    holdList: '/osg-open-uc0001/member/c9/f03',
-    wantbindhold: '/osg-open-uc0001/member/c9/f04',
-    holdsign: '/osg-open-uc0001/member/c9/f07',
-    Mainhold: '/osg-open-uc0001/member/c9/f05',
-    untying: '/osg-open-uc0001/member/c14/f03',
-    holdCert: '/osg-open-uc0001/member/c5/f02',
-    onSite: '/osg-open-woc0001/member/c27/f20',
-    subJudge: '/osg-open-sfan0001/member/c4/f01',
-    getevalMsg: '/osg-open-om0001/member/c8/f02',
-    getVCommit: '/osg-open-sfan0001/member/c4/f02',
-    pauseSCode: '/osg-open-woc0001/member/c27/f30',
-    newSCode: '/osg-web0004/member/c15/f05',
-    pauseTCode: '/osg-open-woc0001/member/c27/f24',
-    giveHome: '/osg-open-woc0001/member/c4/f13',
-    reName: '/osg-open-woc0001/member/c4/f12',
-    uploadPic: '/osg-open-scp0001/member/c5/f05',
-    uploadAuthPic: '/osg-open-scp0001/member/c5/f07',
-    invoiceList: '/osg-open-bc0001/member/c02/f01',
-    operaLis: '/osg-open-bc0001/member/c02/f03',
-    kpdetailsLis: '/osg-open-bc0001/member/c02/f02',
-    unread: '/osg-open-mce0001/member/c4/f02',
-    readAllMsg: '/osg-open-mce0001/member/c4/f07',
-    markRead: '/osg-open-mce0001/member/arg/010410001',
-    newsdetails: '/osg-open-mce0001/member/c4/f04',
-    newsdelete: '/osg-open-mce0001/member/c4/f05',
-    pay: '/osg-wp0004/member/payment/getPayMethodList',
-    createOrder: '/osg-wp0002/member/charge/createOrder',
-    invokey: '/osg-wp0002/member/charge/invokePay',
-    surplus: '/osg-wp0002/member/charge/getElecUserChargeList',
-    orderStatus: '/osg-wp0002/member/charge/getOrderHeaderStatus',
-    reCardVer: '/osg-wp0002/member/charge/checkRechargeUser',
-    reCardRecharge: '/osg-wp0002/member/charge/rechargeCard',
-    searchUser: '/osg-open-uc0001/member/c9/f02',
-    send: '/osg-open-uc0001/member/c8/f04',
-    code: '/osg-open-uc0001/member/c8/f05',
-    electBill: '/osg-open-bc0001/member/c04/f03',
-    segmentDate: '/osg-open-bc0001/member/arg/020070013',
-    Progress: '/osg-web0004/member/c18/f01',
-    searchProgress2: '/osg-open-uc0001/member/c6/f07',
-    lookMore: '/osg-open-uc0001/member/c6/f02',
-    gdAnniu: '/osg-open-woc0001/member/c27/f19',
-    deleteProgress: '/osg-open-uc0001/member/c6/f05',
-    dataList: 'osg-open-woc0001/member/c27/f16',
-    dataList2: 'osg-open-woc0001/member/c27/f17',
-    getData: '/osg-open-woc0001/member/c27/f28',
-    getOtherData: '/osg-open-woc0001/member/arg/020370031',
-    startData: '/osg-open-woc0001/member/c27/f27',
-    complaintsubmit: '/osg-open-woc0001/member/c5/f00',
-    reportsubmit: '/osg-open-woc0001/member/c5/f01',
-    professionsubmit: '/osg-open-woc0001/member/c5/f02',
-    havesaysubmit: '/osg-open-woc0001/member/c5/f03',
-    faultrepairsubmit: '/osg-open-woc0001/member/c5/f04',
-    faultrepair: '/osg-open-om0001/member/c72/f02',
-    idauthen: '/osg-open-woc0001/member/c27/f26',
-    companySub: '/osg-open-woc0001/member/c4/f07',
-    increaseSub: '/osg-open-woc0001/member/c4/f10',
-    subzj: '/osg-open-woc0001/member/c4/f06',
-    order: '/osg-open-scp0001/member/c4/f01',
-    vatchang: '/osg-open-woc0001/member/c4/f17',
-    doorNumber: '/osg-open-uc0001/member/c9/f02',
-    setMainDoor: '/osg-open-uc0001/member/c9/f05',
-    queryAbleBindDoorNumber: '/osg-open-uc0001/member/c9/f03',
-    identitySubmit: '/osg-open-uc0001/member/c8/f02',
-    listconsumers: '/osg-open-uc0001/member/c6/f03',
-    delListconsumers: '/osg-open-uc0001/member/arg/020360024',
-    listconsumers_Progress: '/osg-open-uc0001/member/c6/f01',
-    stopCapacity: '/osg-open-woc0001/member/c4/f01',
-    lessCapacity: '/osg-open-woc0001/member/c4/f02',
-    personageApi: '/osg-open-woc0001/member/c4/f11',
-    newHouseholdElectricity: '/osg-open-woc0001/member/c4/f08',
-    certificationSearchFinal: '/osg-open-uc0001/member/c8/f11',
-    identitymap: '/osg-open-uc0001/member/c8/f08',
-    OCR: '/osg-open-uc0001/member/c8/f09',
-    adFlag: '/osg-open-uc0001/member/c14/f01',
-    meterCalibration: '/osg-open-woc0001/member/c4/f05',
-    meteringPoint: '/osg-open-uc0001/member/c6/f11',
-    transformer: '/osg-open-uc0001/member/c6/f08',
-    powerSupply: '/osg-open-uc0001/member/c6/f10',
-    updateUserInfo: '/osg-open-uc0001/member/c8/f03',
-    updateAccount: '/osg-open-uc0001/member/c8/f26',
-    userInfo: '/osg-open-uc0001/member/c8/f01',
-    pauseSub: '/osg-open-woc0001/member/c4/f15',
-    reduceSub: '/osg-open-woc0001/member/c4/f16',
-    infoSupplement: '/osg-open-woc0001/member/c27/f25',
-    electricityPriceStrategyChange: '/osg-open-woc0001/member/arg/030340052',
-    subscriptionList: '/osg-open-mce0001/member/c7/f00',
-    participate: '/osg-open-mce0001/member/c05/f04',
-    fuzzySearch: '/osg-open-uc0001/member/c4/f04',
-    downloadImg: '/osg-open-scp0001/member/c5/f02',
-    tokendownloadImg: '/osg-open-uc0001/member/c8/f72',
-    eemandValueAdjustment: '/osg-open-woc0001/member/c4/f14',
-    oneOffice: '/osg-open-scp0001/member/c4/f02',
-    ceshi: '/osg-rm0001/member/c1/f05',
-    InformationConfirmation: '/osg-open-woc0001/member/c27/f21',
-    vatlist: '/osg-open-om0001/member/c72/f03',
-    payAmtList: '/osg-web0004/member/c77/f01',
-    accapi: '/osg-open-bc0001/member/c05/f01',
-    chergileApi: '/osg-open-woc0001/member/c4/f04',
-    otherApi: '/osg-open-woc0001/member/c27/f40',
-    demographicStatus: '/osg-open-sfan0001/member/c5/f01',
-    demoGraphicChecks: '/osg-open-sfan0001/member/c5/f03',
-    subDemoGraphic: '/osg-woc0001/member/c72/f01',
-    checkHomeApi: '/osg-open-sfan0001/member/c5/f02',
-    biaojiDanHao: '/osg-open-uc0001/member/c6/f09',
-    electTrend: '/osg-open-bc0001/member/c03/f14',
-    dayElectLoad: '/osg-open-bc0001/member/c03/f05',
-    electLoadTrend: '/osg-open-bc0001/member/c03/f06',
-    JiFen: '/osg-open-om0001/member/c19/f01',
-    JiFenYuE: '/osg-open-om0001/member/c19/f02',
-    searchBankBind: '/osg-open-uc0001/member/c8/f18',
-    hasBindBankAuth: '/osg-open-uc0001/member/c8/f20',
-    bankAuthSendCode: '/osg-open-uc0001/member/c8/f16',
-    HBankAuthCode: '/osg-open-uc0001/member/c8/f15',
-    searchBankXY: '/osg-open-uc0001/member/c8/f14',
-    searchIDofBank: '/osg-open-uc0001/member/c8/f13',
-    searchTypeOfBank: '/osg-open-uc0001/member/c8/f12',
-    boundsendver: '/osg-open-uc0001/member/c8/f21',
-    friendLink: '/osg-web0004/open/c5/f01',
-    getIPAddr: '/osg-web0004/open/c8/f01',
-    pauseSCodeApi: '/osg-open-woc0001/member/c27/f30',
-    checkCodeApi: '/osg-woc0001/member/c2/f01',
-    payCodeApi: '/osg-open-uc0001/member/arg/030010192',
-    empowerBindApi: '/osg-open-uc0001/member/arg/030010193',
-    getAuthToken: '/osg-open-uc0001/member/arg/020360047',
-    getUserInfoByAuthToken: '/osg-open-uc0001/member/arg/020360048',
-    loginVerifyCode: '/osg-web0004/open/c44/f01',
-    loginTestCode: '/osg-web0004/open/c44/f02',
-    loginVerifyCodeNew: '/osg-web0004/open/c44/f05',
-    loginTestCodeNew: '/osg-web0004/open/c44/f06',
-    jsonApi: '/osg-web0004/member/c15/f01',
-    getNewsApi: '/osg-web0004/open/c4/f04',
-    getBankInfo: '/osg-open-uc0001/member/c8/f17',
-    newsListApi: '/osg-web0004/member/c15/f02',
-    StopList: '/osg-open-mce0001/member/c06/f01',
-    busInfoApi: '/osg-web0004/member/c24/f01',
-    getIntelligentPaymentStatus: '/osg-open-bc0001/member/arg/020070032',
-    getnewPhoneCode: '/osg-web0004/member/c15/f03',
-    allFileLists: '/osg-web0004/member/c24/f02',
-    changePhoneGetOldCode: '/osg-web0004/member/c15/f04',
-    emergencys: '/osg-open-p0001/member/c5/f03',
-    theme: '/osg-web0004/open/c3/f01',
-    backOrderMsg: '/osg-woc0001/member/c70/f01',
-    queryCarAddress: '/osg-web0004/member/c49/f01',
-    queryBoundGroupAccount: '/osg-open-uc0001/member/arg/030360248',
-    queryBoundGroupSubAccount: '/osg-open-uc0001/member/arg/030360252',
-    queryElectricEnterprise: '/osg-open-bc0001/member/arg/030070112',
-    queryAccountNumberBoundEnterprise: '/osg-open-bc0001/member/arg/030070112',
-    queryapUPConsumingEnterprises: '/osg-open-bc0001/member/arg/030070113',
-    queryPowerHandlingProcess: '/osg-open-woc0001/member/arg/030010214',
-    getAppaVersion: '/osg-web0004/open/c17/f01',
-    homeMsgBox: '/osg-web0004/open/c18/f01',
-    excludeDayCompany: '/osg-open-bc0001/member/c11/f04',
-    excludeDayUser: '/osg-open-bc0001/member/c11/f03',
-    excludeMonthCompany: '/osg-open-bc0001/member/c11/f02',
-    excludeMonthUser: '/osg-open-bc0001/member/c11/f01',
-    eleMonthForecast: '/osg-open-bc0001/member/c11/f00',
-    eleMonthRange: '/osg-open-bc0001/member/c10/f14',
-    eleMonthRangePermit: '/osg-open-bc0001/member/c10/f16',
-    eleDayRange: '/osg-open-bc0001/member/c10/f17',
-    eleDayRangePermit: '/osg-open-bc0001/member/c10/f19',
-    ListAgentUsersElectricitySellingE: '/osg-open-uc0001/member/c9/f11',
-    ListAuthorizeUsersElectricitySellingE: '/osg-open-sfan0001/member/c8/f03',
-    BoundEnterpriseQuery: '/osg-open-uc0001/member/c9/f14',
-    eleMonthThb: '/osg-open-bc0001/member/c10/f14',
-    eleApplyCount: '/osg-open-bc0001/member/c11/f27',
-    eleApplyCountChart: '/osg-open-bc0001/member/c11/f28',
-    applyList: '/osg-open-bc0001/member/c11/f29',
-    unApplyList: '/osg-open-bc0001/member/c11/f30',
-    sendMessageByBatch: '/osg-open-bc0001/member/c11/f32',
-    sendMessageByOne: '/osg-open-bc0001/member/c11/f31',
-    exportApplyedData: '/osg-open-bc0001/member/c11/f56',
-    priceDeviationData: '/osg-open-bc0001/member/c11/f52',
-    priceDeviationTimeType: '/osg-open-bc0001/member/c11/f47',
-    priceClearingCount: '/osg-open-bc0001/member/c11/f41',
-    priceClearingList: '/osg-open-bc0001/member/c11/f42',
-    priceClearingDelete: '/osg-open-bc0001/member/c11/f45',
-    priceClearingDetail: '/osg-open-bc0001/member/c11/f43',
-    priceClearingUpdate: '/osg-open-bc0001/member/c11/f44',
-    priceClearingImportExcel: '/osg-open-bc0001/member/c11/f46',
-    getMetaRegionByFullId: '/osg-open-bc0001/member/c11/f48',
-    getElecList: '/osg-open-bc0001/member/c11/f13',
-    electDelete: '/osg-open-bc0001/member/c11/f15',
-    electDetails: '/osg-open-bc0001/member/c11/f14',
-    electSave: '/osg-open-bc0001/member/c11/f16',
-    applyPageList: '/osg-open-bc0001/member/c11/f49',
-    applyPageCount: '/tradeApplyCaseRq/findApplyCaseRqCount',
-    applyCaseRqDetail: ' /osg-open-bc0001/member/c11/f50',
-    applyCaseRqList: '/osg-open-bc0001/member/c11/f51',
-    applyCaseRqSave: '/osg-open-bc0001/member/c11/f53',
-    applyCaseRqDel: '/osg-open-bc0001/member/c11/f54',
-    doHourCompanyFourcast: '/osg-open-bc0001/member/c11/f06',
-    doSaveHourFourcast: ' /osg-open-bc0001/member/c11/f07',
-    getHourFourcastTasklist: '/osg-open-bc0001/member/c11/f08',
-    getHourFourcastResultOneday: '/osg-open-bc0001/member/c11/f55',
-    getHourFourcastResultByRefId: '/osg-open-bc0001/member/c11/f10',
-    deleteHourFourcastResultByRefId: '/osg-open-bc0001/member/c11/f11',
-    getDivisionByProviceCode: '/osg-open-bc0001/member/c11/f12',
-    tCsaveTrade: '/osg-open-bc0001/member/c11/f33',
-    tCsetMealList: '/osg-open-bc0001/member/c11/f34',
-    tCdeleteOneById: '/osg-open-bc0001/member/c11/f35',
-    tCgetTcDetailListByTcId: '/osg-open-bc0001/member/c11/f38',
-    eleApplyList: '/osg-open-bc0001/member/c11/f23',
-    eleApplyOne: '/osg-open-bc0001/member/c11/f24',
-    eleApplySave: '/osg-open-bc0001/member/c11/f22',
-    eleApplyModify: '/osg-open-bc0001/member/c11/f26',
-    priceCatPrcQueryBySecNoAndProvince: '/osg-open-bc0001/member/c11/f20',
-    priceCatPrcSave: '/osg-open-bc0001/member/c11/f21',
-    priceCatPrcQueryForecastData: '/osg-open-bc0001/member/c11/f18',
-    priceCatPrcGetBySecNo: '/osg-open-bc0001/member/c11/f17',
-    priceCatPrcQueryElecHourData: '/osg-open-bc0001/member/c11/f19',
-    applyDeviAnalyQuery: '/osg-open-bc0001/member/c11/f05',
-    goodsSaveData: '/osg-open-bc0001/member/arg/030070085',
-    goodsqueryList: '/osg-open-bc0001/member/arg/030070086',
-    getDataByGoodsId: '/osg-open-bc0001/member/arg/030070087',
-    goodsDelete: '/osg-open-bc0001/member/arg/030070088',
-    goodsUpShelf: '/osg-open-bc0001/member/arg/030070089',
-    goodsOffShelf: '/osg-open-bc0001/member/arg/030070090',
-    goodsUploadFile: '/osg-open-bc0001/member/c11/f57',
-    goodsDownloadFile: '/osg-open-bc0001/member/c11/f59',
-    uploadFile: '/osg-open-bc0001/member/c11/f57',
-    fileList: '/osg-open-bc0001/member/arg/030070083',
-    downloadFileList: '/osg-open-bc0001/member/c11/f59',
-    downloadFile: '/osg-open-bc0001/member/c11/f58',
-    deleteFileById: '/osg-open-bc0001/member/arg/030070084',
-    ordersList: '/osg-open-bc0001/member/arg/030210002',
-    ordersDetail: '/osg-open-bc0001/member/arg/030070100',
-    saveHtMain: '/osg-open-bc0001/member/arg/030070101',
-    queryHtMainByOrderId: '/osg-open-bc0001/member/arg/030070102',
-    comboOrdersApplyCancel: '/osg-open-bc0001/member/arg/030070092',
-    comboOrdersConfirmCancel: '/osg-open-bc0001/member/arg/030070093',
-    getFavList: '/osg-open-bc0001/member/arg/030070081',
-    cancelFav: '/osg-open-bc0001/member/arg/030070080',
-    saveFav: '/osg-open-bc0001/member/arg/030070079',
-    ifFav: '/osg-open-bc0001/member/arg/030070082',
-    queryEnquiryPageList: '/osg-open-bc0001/member/arg/030070095',
-    goodsEnquirySaveData: '/osg-open-bc0001/member/arg/030070094',
-    saveReplyEnquiryData: '/osg-open-bc0001/member/arg/030070099',
-    goodsEnquiryList: '/osg-open-bc0001/member/arg/030070095',
-    goodsComboordersCreate: '/osg-open-bc0001/member/arg/030070091',
-    goodsComboordersJudgeQualifications:
-      '/osg-open-bc0001/member/arg/030070098',
-    goodsEnquiryOfferPriceJudge: '/osg-open-bc0001/member/arg/030070096',
-    goodsEnquiryOfferPrice: '/osg-open-bc0001/member/arg/030070097',
-    goodsEnquiryOffShelf: '/osg-open-bc0001/member/arg/030070105',
-    queryDataListByEnquiryVo: '/osg-open-bc0001/member/arg/030070106',
-    queryEnquiryListPage: '/osg-open-bc0001/member/arg/030070107',
-    saveBackEnquiryData: '/osg-open-bc0001/member/arg/030070108',
-    enquiryOrdersApplyCancel: '/osg-open-bc0001/member/arg/030070109',
-    enquiryOrdersConfirmCancel: '/osg-open-bc0001/member/arg/030070110',
-    saveFiles: '/osg-open-bc0001/member/arg/030070111',
-    BindingOfElectricitySellingEnterprises: '/osg-open-uc0001/member/c9/f24',
-    BindEnterprise: '/osg-open-uc0001/member/c8/f60',
-    BoundEnterpriseQuery: '/osg-open-uc0001/member/c9/f14',
-    ListAgentUsersElectricitySellingE: '/osg-open-uc0001/member/c9/f11',
-    getSDCode: '/osg-open-uc0001/member/c8/f04',
-    excludeDayCompany: '/osg-open-bc0001/member/c11/f04',
-    excludeDayUser: '/osg-open-bc0001/member/c11/f03',
-    excludeMonthCompany: '/osg-open-bc0001/member/c11/f02',
-    excludeMonthUser: '/osg-open-bc0001/member/c11/f01',
-    queryHandlerManagement: '/osg-open-sfan0001/member/arg/030330101',
-    handlerPhoneCheck: '/osg-open-sfan0001/member/arg/030330102',
-    getBindHandlerCode: '/osg-open-uc0001/member/arg/030360273',
-    cancelHandlerBind: '/osg-open-sfan0001/member/arg/030330103',
-    infoPublic: '/osg-omgmt1015/content/c01/f52',
-    electrovalenceStandard: '/osg-omgmt1030/priceinfo/c01/f04',
-    electrovalenceType: '/osg-omgmt1030/priceinfo/c01/f05',
-    classicCase: '/osg-omgmt1030/content/c01/f52',
-    uploadfile: '/osg-scp0002/member/c2/f03',
-    dispute: '/osg-open-woc0001/member/c27/f52',
-    disputeDetail: '/osg-open-woc0001/member/c27/f53',
-    selldispite: '/osg-open-woc0001/member/c27/f51',
-    information: '/osg-open-om0001/member/c16/f02',
-    informationList: '/osg-open-om0001/member/c16/f03',
-    searchKeyWords: '/osg-open-om0001/member/arg/020390035',
-    searchKeyWordsInfo: 'emss-pfa-pro-front/app_api/selectNewChannelist',
-    billingService: '/osg-open-bc0001/member/c10/f01',
-    monthSearch: '/osg-open-bc0001/member/c03/f15',
-    dataSearch: '/osg-open-bc0001/member/c03/f16',
-    pointSearch: '/osg-open-bc0001/member/c03/f17',
-    indicatSearch: '/osg-open-bc0001/member/c03/f18',
-    indicatPost: '/osg-open-bc0001/member/c03/f19',
-    querySuperAdministrator: '/osg-open-sfan0001/member/arg/030010096',
-    applySuperAdministrator: '/osg-open-sfan0001/member/arg/030330099',
-    getApplicationRecord: '/osg-open-sfan0001/member/arg/030330100',
-    fileUpload: '/osg-open-sfan0001/member/arg/030010098',
-    fileDownload: '/osg-open-sfan0001/member/arg/030010097',
-    querySellerPageList: '/osg-open-sfan0001/member/arg/030010182',
-    querySettlePageList: '/osg-open-sfan0001/member/arg/030010183',
-    elecYdPuPageList: '/osg-open-sfan0001/member/arg/030010178',
-    elecYdPuConfirm: '/osg-open-sfan0001/member/arg/030010179',
-    elecYdPuExport: '/saler/dldl/export',
-    elecSbFdSaveSwdl: '/osg-open-sfan0001/member/arg/030010180',
-    elecSbFdGetSwdl: '/osg-open-sfan0001/member/arg/030010181',
-    salerDldjPageList: '/osg-open-sfan0001/member/arg/030010173',
-    salerDldjConfirm: '/osg-open-sfan0001/member/arg/030010174',
-    salerDldjSave: '/osg-open-sfan0001/member/arg/030010175',
-    salerDldjImport: '/osg-open-sfan0001/member/arg/030010176',
-    salerDldjExport: '/osg-open-sfan0001/member/arg/030010177',
-    unbindPowerGenerationEnterprise: '/osg-open-uc0001/member/arg/030360278',
-    queryPowerGenerationEnterpriseList: '/osg-open-uc0001/member/arg/030360279',
-    bindPowerGenerationEnterprise: '/osg-open-uc0001/member/arg/030360280',
-    queryBoundPowerGenerationEnterpriseList:
-      '/osg-open-uc0001/member/arg/030370095',
-    queryPowerGenerationEnterpriseDetail:
-      '/osg-open-uc0001/member/arg/030360281',
-    downloadNewGenFile: '/osg-open-bc0001/member/arg/020010002',
-    downloadNewGenFile: '/osg-open-bc0001/member/arg/020010002',
-    unbindPowerGenerationEnterprise: '/osg-open-uc0001/member/arg/030360278',
-    queryPowerGenerationEnterpriseList: '/osg-open-uc0001/member/arg/030360279',
-    bindPowerGenerationEnterprise: '/osg-open-uc0001/member/arg/030360280',
-    queryBoundPowerGenerationEnterpriseList:
-      '/osg-open-uc0001/member/arg/030370095',
-    queryPowerGenerationEnterpriseDetail:
-      '/osg-open-uc0001/member/arg/030360281',
-    queryMonthElec: '/osg-open-bc0001/member/arg/020010008',
-    queryMonthsElec: '/osg-open-bc0001/member/arg/020010010',
-    queryDayElec: '/osg-open-bc0001/member/arg/020010009',
-    queryDaysElec: '/osg-open-bc0001/member/arg/020010011',
-    billPageList: '/osg-open-bc0001/member/arg/020010003',
-    getBillById: '/osg-open-bc0001/member/arg/020010005',
-    getMonthBillByMemberID: '/osg-open-bc0001/member/arg/020010004',
-    getBillSummaryData: '/osg-open-bc0001/member/arg/020010007',
-    submitBillData: '/osg-open-bc0001/member/arg/020010006',
-    viewBindingAccountNumber: '/osg-open-uc0001/member/c9/f22',
-    highVoltageSubscriberBinding: '/osg-open-uc0001/member/arg/020210008',
-    saveGfPersonal: '/osg-open-om0001/member/arg/030010195',
-    saveGfEnterprise: '/osg-open-om0001/member/arg/030010196',
-    getGfOwnBankList: '/osg-open-om0001/member/arg/030010203',
-    getGfAgentBankList: '/osg-open-om0001/member/arg/030010201',
-    getGfBankList: '/osg-open-om0001/member/arg/030010205',
-    changeGfBank: '/osg-open-om0001/member/arg/030010206',
-    saveGfOwnBank: '/osg-open-om0001/member/arg/030010204',
-    saveGfAgentBank: '/osg-open-om0001/member/arg/030010202',
-    getGfPhoneCode: '/osg-open-om0001/member/arg/030010199',
-    jointBusinessQuery: '/osg-open-woc0001/member/arg/030010211',
-    jointBusinessSubmit: '/osg-open-woc0001/member/arg/030010212',
-    sendSMS: '/osg-open-uc0001/member/c8/f48',
-    getGBServiceList: '/osg-open-uc0001/member/arg/030360295',
-    checkGBAccount: '/osg-open-uc0001/member/arg/030360297',
-    GBEmpowerBind: '/osg-open-uc0001/member/arg/030360296',
-    getStaticLink: '/osg-open-om0001/member/c11/f07',
-    getBankDatainfo: '/osg-open-sfan0001/member/arg/010210042',
-    labelsAccordingColumn: '/osg-web0004/open/c20/f01',
-    getOurGradesConf: '/osg-web0004/open/c19/f01',
-    subscribeInvoice: '/osg-open-bc0001/member/arg/030070148',
-    emailSubscribe: '/osg-open-bc0001/member/arg/030070146',
-    invoiceingEle: '/osg-open-bc0001/member/arg/030070144',
-    invoiceListBj: '/osg-open-bc0001/member/arg/030070142',
-    invoiceListZl: '/osg-open-bc0001/member/arg/030070149',
-    invoicePrivate: '/osg-open-bc0001/member/arg/020070007',
-    qurGcNoListNew: '/osg-open-woc0001/member/arg/020370033',
-    getConfigInfo: '/osg-open-woc0001/member/arg/020370034',
-    iphoneController: '/osg-open-woc0001/member/arg/020370035',
-    selectElectricity: '/osg-open-woc0001/member/arg/020370038',
-    selectPayScheduleNew: '/osg-open-woc0001/member/arg/020370039',
-    payMessageFeedbackNew: '/osg-open-woc0001/member/arg/020370040',
-    selectActualPaymentInfo: '/osg-open-woc0001/member/arg/020370041',
+  /**
+   * 判断值是否为"真"
+   * 支持 true、'true'、1、'1' 四种形式
+   */
+  isTrue = e => !0 === e || 'true' === e || 1 === e || '1' === e;
+
+/******************************************
+ * 第八部分：API接口定义
+ * 
+ * 网上国网APP的API接口路径
+ ******************************************/
+
+const $api = {
+  getKeyCode: '/oauth2/outer/c02/f02',        // 获取加密密钥
+  getAuth: '/oauth2/oauth/authorize',          // 获取授权码
+  getWebToken: '/oauth2/outer/getWebToken',    // 获取访问令牌
+  searchUser: '/osg-open-uc0001/member/c9/f02', // 查询用户绑定信息
+  loginVerifyCodeNew: '/osg-web0004/open/c44/f05', // 获取验证码
+  loginTestCodeNew: '/osg-web0004/open/c44/f06',   // 登录验证
+  accapi: '/osg-open-bc0001/member/c05/f01',       // 查询电费
+  busInfoApi: '/osg-web0004/member/c24/f01',       // 查询用电量
+};
+
+/******************************************
+ * 第九部分：API请求配置
+ * 
+ * 网上国网API所需的固定参数配置
+ * 这些参数模拟了官方APP的请求格式
+ ******************************************/
+
+const $configuration = {
+  source: 'SGAPP',
+  target: 'SGAPP',
+  serviceCode: '0101183',
+  uscInfo: {
+    member: '0902',
+    devciceIp: '',
+    devciceId: '',
+    tenant: 'state_grid',
   },
-  $configuration = {
-    uscInfo: {
-      member: '0902',
-      devciceIp: '',
-      devciceId: '',
-      tenant: 'state_grid',
-    },
-    source: 'SGAPP',
-    target: '32101',
+  userInform: { serviceCode: '0101143' },
+  account: { channelCode: '0902', funcCode: 'WEBA10071300' },
+  getday: {
     channelCode: '0902',
-    channelNo: '0902',
-    toPublish: '01',
-    siteId: '2012000000033700',
-    srvCode: '',
-    serialNo: '',
-    funcCode: '',
-    serviceCode: {
-      order: '0101154',
-      uploadPic: '0101296',
-      pauseSCode: '0101250',
-      pauseTCode: '0101251',
-      listconsumers: '0101093',
-      messageList: '0101343',
-      submit: '0101003',
-      sbcMsg: '0101210',
-      powercut: '0104514',
-      BkAuth01: 'f15',
-      BkAuth02: 'f18',
-      BkAuth03: 'f02',
-      BkAuth04: 'f17',
-      BkAuth05: 'f05',
-      BkAuth06: 'f16',
-      BkAuth07: 'f01',
-      BkAuth08: 'f03',
-    },
-    electricityArchives: { servicecode: '0104505', source: '0902' },
-    subscriptionList: {
-      srvCode: 'APP_SGPMS_05_030',
-      serialNo: '22',
-      channelCode: '0902',
-      funcCode: '22',
-      target: '-1',
-    },
-    userInformation: { serviceCode: '01008183', source: 'SGAPP' },
-    userInform: { serviceCode: '0101183', source: 'SGAPP' },
-    elesum: {
-      channelCode: '0902',
-      funcCode: 'WEBALIPAY_01',
-      promotCode: '1',
-      promotType: '1',
-      serviceCode: '0101143',
-      source: 'app',
-    },
-    account: { channelCode: '0902', funcCode: 'WEBA1007200' },
-    doorNumberManeger: {
-      source: '0902',
-      target: '-1',
-      channelCode: '09',
-      channelNo: '09',
-      serviceCode: '01010049',
-      funcCode: 'WEBA40050000',
-      uscInfo: {
-        member: '0902',
-        devciceIp: '',
-        devciceId: '',
-        tenant: 'state_grid',
-      },
-    },
-    doorAuth: { source: 'SGAPP', serviceCode: 'f04' },
-    xinZ: {
-      serCat: '101',
-      jM_busiTypeCode: '101',
-      fJ_busiTypeCode: '102',
-      jM_custType: '03',
-      fJ_custType: '02',
-      serviceType: '01',
-      subBusiTypeCode: '',
-      funcCode: 'WEBA10070700',
-      order: '0101154',
-      source: 'SGAPP',
-      querytypeCode: '1',
-    },
-    onedo: {
-      serviceCode: '0101046',
-      source: 'SGAPP',
-      funcCode: 'WEBA10070700',
-      queryType: '03',
-    },
-    xinHuTongDian: {
-      serCat: '110',
-      busiTypeCode: '211',
-      subBusiTypeCode: '21102',
-      funcCode: 'WEBA10071200',
-      channelCode: '0902',
-      source: '09',
-      serviceCode: '0101183',
-    },
-    company: {
-      serCat: '104',
-      funcCode: 'WEBA10070700',
-      serviceType: '02',
-      querytypeCode: '1',
-      authFlag: '1',
-      source: 'SGAPP',
-      order: '0101154',
-    },
-    charge: {
-      channelCode: '09',
-      funcCode: 'WEBA10071300',
-      channelNo: '0901',
-      serCat: '102',
-      jM_custType: '01',
-      jM_busiTypeCode: '102',
-    },
-    other: {
-      channelCode: '09',
-      funcCode: 'WEBA10079700',
-      serCat: '129',
-      busiTypeCode: '999',
-      subBusiTypeCode: '21501',
-      serviceCode: 'BCP_000026',
-      srvCode: '',
-      serialNo: '',
-    },
-    vatchange: {
-      submit: '0101003',
-      busiTypeCode: '320',
-      subBusiTypeCode: '',
-      serCat: '115',
-      funcCode: 'WEBA10074000',
-      authFlag: '1',
-    },
-    bill: {
-      clearCache: '1',
-      funcCode: 'WEBALIPAY_01',
-      promotType: '1',
-      serviceCode: 'BCP_000026',
-    },
-    stepelect: {
-      channelCode: '0902',
-      funcCode: 'WEBALIPAY_01',
-      promotType: '1',
-      clearCache: '09',
-      serviceCode: 'BCP_000026',
-      source: 'app',
-    },
-    intelligentPayment: { serviceCode: '0102719', source: 'SGAPP' },
-    getday: {
-      channelCode: '0902',
-      clearCache: '11',
-      funcCode: 'WEBALIPAY_01',
-      promotCode: '1',
-      promotType: '1',
-      serviceCode: 'BCP_000026',
-      source: 'app',
-    },
-    mouthOut: {
-      channelCode: '0902',
-      clearCache: '11',
-      funcCode: 'WEBALIPAY_01',
-      promotCode: '1',
-      promotType: '1',
-      serviceCode: 'BCP_000026',
-      source: 'app',
-    },
-    meter: {
-      serCat: '114',
-      busiTypeCode: '304',
-      funcCode: 'WEBA10071000',
-      subBusiTypeCode: '',
-      serviceCode: '0101046',
-      serialNo: '',
-    },
-    complaint: {
-      busiTypeCode: '005',
-      srvMode: '0902',
-      anonymousFlag: '0',
-      replyMode: '01',
-      retvisitFlag: '01',
-    },
-    report: { busiTypeCode: '006' },
-    tradewinds: { busiTypeCode: '019' },
-    somesay: { busiTypeCode: '091' },
-    faultrepair: {
-      funcCode: 'WEBA10070900',
-      serviceCode: '0101183',
-      serCat: '111',
-      busiTypeCode: '001',
-      subBusiTypeCode: '21505',
-    },
-    electronicInvoice: { serCat: '105', busiTypeCode: '0' },
-    rename: {
-      serviceCode: '0101046',
-      funcCode: 'WEBA10076100',
-      busiTypeCode: '210',
-      serCat: '109',
-      authFlag: '1',
-      gh_busiTypeCode: '211',
-      gh_subusi: '21101',
-      serialNo: '',
-      srvCode: '',
-    },
-    pause: {
-      subBusiTypeCode: '',
-      serviceCode: '01010049',
-      funcCode: 'WEBA10073600',
-      serCat: '107',
-      busiTypeCode: '201',
-      jr_busi: '201',
-      serialNo: '',
-      srvCode: '',
-      order: '0101154',
-      source: 'SGAPP',
-      querytypeCode: '1',
-    },
-    capacityRecovery: {
-      serviceCode: '01010049',
-      source: 'SGAPP',
-      srvCode: '',
-      serialNo: '',
-      funcCode: 'WEBA10073700',
-      busiTypeCode_stop: '204',
-      busiTypeCode_less: '202',
-      busiTypeCode: '202',
-      subBusiTypeCode: '',
-      serCat: '108',
-      timeDay: '5',
-      authFlag: '1',
-    },
-    electricityPriceChange: {
-      serviceCode: '0101183',
-      busiTypeCode: '215',
-      subBusiTypeCode: '21502',
-      serCat: '113',
-      authFlag: '1',
-      timeDay: '15',
-      funcCode: 'WEBA10073900WEB',
-      srvCode: '',
-      serialNo: '',
-    },
-    electricityPriceStrategyChange: {
-      serviceCode: '01008183',
-      busiTypeCode: '215',
-      subBusiTypeCode: '21506',
-      serCat: '160',
-      funcCode: 'WEBV00000517WEB',
-      srvCode: '',
-      serialNo: '',
-    },
-    eemandValueAdjustment: {
-      serviceCode: '0101183',
-      srvCode: '',
-      serialNo: '',
-      serCat: '112',
-      funcCode: 'WEBA10073800',
-      busiTypeCode: '215',
-      subBusiTypeCode: '21504',
-      authFlag: '1',
-      timeDay: '5',
-      getMonthServiceCode: '0101046',
-    },
-    businessProgress: {
-      serviceCode: '0101183',
-      srvCode: '01',
-      funcCode: 'WEB01',
-    },
-    increase: {
-      source: 'SGAPP',
-      serialNo: '',
-      srvCode: '',
-      serviceCode_smt: '01010049',
-      serviceCode: '0101154',
-      order: '0101154',
-      funcCode: 'WEBA10070800',
-      querytypeCode: '1',
-      serCat: '106',
-      busiTypeCode: '111',
-      subBusiTypeCode: '',
-    },
-    fjincrea: {
-      serCat: '105',
-      busiTypeCode: '110',
-      subBusiTypeCode: '',
-      source: 'SGAPP',
-      funcCode: 'WEBA10070800',
-      serialNo: '',
-      srvCode: '',
-      serviceCode_smt: '01010049',
-      serviceCode: '0101154',
-      order: '0101154',
-      querytypeCode: '1',
-    },
-    persIncrea: {
-      serCat: '105',
-      busiTypeCode: '109',
-      order: '0101154',
-      subBusiTypeCode: '',
-      source: 'SGAPP',
-      funcCode: 'WEBA10070800',
-      querytypeCode: '1',
-    },
-    fgdChange: {
-      serviceCode: '0101183',
-      srvCode: '01',
-      channelCode: '09',
-      funcCode: 'WEBA10070900',
-      busiTypeCode: '215',
-      subBusiTypeCode: '21505',
-      serCat: '111',
-      authFlag: '1',
-    },
-    createOrder: {
-      channelCode: '0902',
-      funcCode: 'WEBALIPAY_01',
-      srvCode: 'BCP_000001',
-      chargeMode: '02',
-      conType: '01',
-      bizTypeId: 'BT_ELEC',
-    },
-    largePopulation: {
-      busiTypeCode: '383',
-      funcCode: 'WEBA10076800',
-      subBusiTypeCode: '',
-      srvCode: '',
-      promotType: '',
-      promotCode: '',
-      channelCode: '0901',
-      serCat: '383',
-      serviceCode: '',
-      serialNo: '',
-    },
-    biaoJiCode: { serviceCode: '0104507', source: '1704', channelCode: '1704' },
-    biaoJiCode: { serviceCode: '0104507', source: '1704', channelCode: '1704' },
-    twoGuar: {
-      busiTypeCode: '402',
-      subBusiTypeCode: '40201',
-      funcCode: 'web_twoGuar',
-    },
-    electTrend: { serviceCode: 'BCP_00026', channelCode: '0902' },
-    emergency: {
-      serviceCode: 'BCP_00026',
-      funcCode: 'A10000000',
-      channelCode: '0902',
-    },
-    infoPublic: { serviceCode: '2545454', source: 'app' },
+    clearCache: '11',
+    funcCode: 'WEBALIPAY_01',
+    promotCode: '1',
+    promotType: '1',
+    serviceCode: 'BCP_000026',
+    source: 'app',
   },
-  Notify = isNode() ? require('./sendNotify') : '',
-  SCRIPTNAME = '网上国网',
+  mouthOut: {
+    channelCode: '0902',
+    clearCache: '11',
+    funcCode: 'WEBALIPAY_01',
+    promotCode: '1',
+    promotType: '1',
+    serviceCode: 'BCP_000026',
+    source: 'app',
+  },
+};
+
+/******************************************
+ * 第十部分：全局变量初始化
+ ******************************************/
+
+/**
+ * 青龙通知模块（仅在青龙环境中加载）
+ */
+let Notify = '';
+if (isNode() && isQinglong) {
+  try {
+    Notify = require('./sendNotify');
+  } catch (e) {
+    console.log('⚠️ sendNotify 模块未找到，跳过青龙通知');
+  }
+}
+
+const SCRIPTNAME = '网上国网',
   NAMESPACE = 'ONZ3V',
+  /**
+   * 本地存储实例
+   * 用于保存Token和用户信息
+   */
   store = new Store(NAMESPACE),
-  Global =
-    'undefined' != typeof globalThis
-      ? globalThis
-      : 'undefined' != typeof window
-        ? window
-        : 'undefined' != typeof global
-          ? global
-          : 'undefined' != typeof self
-            ? self
-            : {};
+  /**
+   * 全局对象
+   * 用于在函数间共享数据
+   */
+  Global = typeof globalThis !== 'undefined' ? globalThis : typeof window !== 'undefined' ? window : typeof global !== 'undefined' ? global : typeof self !== 'undefined' ? self : {};
+
+/**
+ * 从本地存储加载用户凭证
+ * 包含 token 和 userInfo 等登录信息
+ */
 Global.bizrt = jsonParse(store.get('95598_bizrt')) || {};
-const log = new Logger(
-  SCRIPTNAME,
-  isTrue(isNode() ? process.env.WSGW_LOG_DEBUG : store.get('95598_log_debug'))
-    ? 'debug'
-    : 'info'
-),
-  USERNAME =
-    (isNode() ? process.env.WSGW_USERNAME : store.get('95598_username')) || '',
-  PASSWORD =
-    (isNode() ? process.env.WSGW_PASSWORD : store.get('95598_password')) || '',
-  SHOW_RECENT = isTrue(
-    isNode()
-      ? process.env.WSGW_RECENT_ELC_FEE
-      : store.get('95598_recent_elc_fee')
-  ),
-  NOTIFY_TYPE = isNode()
-    ? process.env.WSGW_NOTIFY_ALL
-    : store.get('95598_notify_type');
+
+/**
+ * 日志实例
+ * 可通过 WSGW_LOG_DEBUG 环境变量开启调试模式
+ */
+const log = new Logger(SCRIPTNAME, isTrue(process.env.WSGW_LOG_DEBUG) ? 'debug' : 'info'),
+  /**
+   * 用户账号密码
+   */
+  USERNAME = process.env.WSGW_USERNAME || '',
+  PASSWORD = process.env.WSGW_PASSWORD || '',
+  /**
+   * 是否显示最近电费详情
+   */
+  SHOW_RECENT = isTrue(process.env.WSGW_RECENT_ELC_FEE);
+
+/**
+ * 历史数据管理器实例
+ */
+const historyManager = new HistoryDataManager();
+
+/******************************************
+ * 第十一部分：核心业务函数
+ * 
+ * 以下是脚本的主要业务逻辑函数
+ * 按照执行顺序排列
+ ******************************************/
+
+/**
+ * 步骤1：获取加密密钥
+ * 
+ * 每次API请求都需要使用 keyCode 和 publicKey 进行加密
+ * 这是网上国网API的安全机制
+ */
 async function getKeyCode() {
   console.log('⏳ 获取keyCode和publicKey...');
   try {
     const e = { url: `/api${$api.getKeyCode}`, method: 'post', headers: {} };
-    (Global.requestKey = await request(e)),
-      log.info('✅ 获取keyCode和publicKey成功'),
-      log.debug(`🔑 keyCode&publicKey: ${jsonStr(requestKey, null, 2)}`);
+    Global.requestKey = await request(e);
+    log.info('✅ 获取keyCode和publicKey成功');
+    log.debug(`🔑 keyCode&publicKey: ${jsonStr(requestKey, null, 2)}`);
   } catch (e) {
     return Promise.reject(`获取keyCode和PublicKey失败: ${e}`);
   } finally {
     console.log('🔚 获取keyCode和publicKey结束');
   }
 }
+
+/**
+ * 步骤2a：获取验证码
+ * 
+ * 网上国网登录需要滑块验证码
+ * 1. 请求获取验证码图片和ticket
+ * 2. 调用中转服务器识别验证码
+ * 
+ * @returns {Object} 包含 code（验证码识别结果）和 ticket
+ */
 async function getVerifyCode() {
   console.log('⏳ 获取验证码...');
   try {
     const e = {
       url: `/api${$api.loginVerifyCodeNew}`,
       method: 'post',
-      data: {
-        password: PASSWORD,
-        account: USERNAME,
-        canvasHeight: 200,
-        canvasWidth: 310,
-      },
+      data: { password: PASSWORD, account: USERNAME, canvasHeight: 200, canvasWidth: 310 },
       headers: { ...requestKey },
-    },
-      o = await request(e);
-    log.info('✅ 获取验证码凭证成功'), log.debug(`🔑 验证码凭证: ${o.ticket}`);
+    };
+    const o = await request(e);
+    log.info('✅ 获取验证码凭证成功');
     const { data: r } = await Recoginze(o.canvasSrc);
-    return (
-      log.info('✅ 识别验证码成功'),
-      log.debug(`🔑 验证码: ${r}`),
-      { code: r, ticket: o.ticket }
-    );
+    log.info('✅ 识别验证码成功');
+    return { code: r, ticket: o.ticket };
   } catch (e) {
     return Promise.reject('获取验证码失败: ' + e);
   } finally {
     console.log('🔚 获取验证码结束');
   }
 }
+
+/**
+ * 步骤2b：登录
+ * 
+ * 使用验证码完成登录
+ * 登录成功后会返回 token 和 userInfo
+ * 
+ * @param {string} e - ticket（验证码凭证）
+ * @param {string} o - code（验证码识别结果）
+ */
 async function login(e, o) {
   console.log('⏳ 登录中...');
   try {
@@ -1333,82 +817,128 @@ async function login(e, o) {
         loginKey: e,
         code: o,
         params: {
-          uscInfo: {
-            devciceIp: '',
-            tenant: 'state_grid',
-            member: '0902',
-            devciceId: '',
-          },
-          quInfo: {
-            optSys: 'android',
-            pushId: '000000',
-            addressProvince: '110100',
-            password: PASSWORD,
-            addressRegion: '110101',
-            account: USERNAME,
-            addressCity: '330100',
-          },
+          uscInfo: { devciceIp: '', tenant: 'state_grid', member: '0902', devciceId: '' },
+          quInfo: { optSys: 'android', pushId: '000000', addressProvince: '110100', password: PASSWORD, addressRegion: '110101', account: USERNAME, addressCity: '330100' },
         },
         Channels: 'web',
       },
-    },
-      { bizrt: s } = await request(r);
-    if (!(s?.userInfo?.length > 0))
-      return Promise.reject('登录失败: 请检查信息填写是否正确! ');
-    store.set('95598_bizrt', jsonStr(s)),
-      (Global.bizrt = s),
-      log.info('✅ 登录成功'),
-      log.debug(
-        `🔑 用户凭证: ${s.token}`,
-        `👤 用户信息: ${s.userInfo[0].nickname || s.userInfo[0].loginAccount}`
-      );
+    };
+    const { bizrt: s } = await request(r);
+    if (!(s?.userInfo?.length > 0)) return Promise.reject('登录失败: 请检查信息填写是否正确! ');
+    /**
+     * 登录成功后保存凭证到本地存储
+     * - 95598_bizrt: 用户凭证（token、userInfo等）
+     * - 95598_token_time: 凭证保存时间（用于判断是否过期）
+     */
+    store.set('95598_bizrt', jsonStr(s));
+    store.set('95598_token_time', Date.now().toString());
+    Global.bizrt = s;
+    log.info('✅ 登录成功');
+    log.debug(`🔑 用户凭证: ${s.token}`, `👤 用户信息: ${s.userInfo[0].nickname || s.userInfo[0].loginAccount}`);
   } catch (e) {
-    return /验证错误/.test(e)
-      ? (log.error(`滑块验证出错, 重新登录: ${e}`), await doLogin())
-      : Promise.reject(`登陆失败: ${e}`);
+    /**
+     * 如果验证码识别错误，自动重试登录
+     */
+    return /验证错误/.test(e) ? (log.error(`滑块验证出错, 重新登录: ${e}`), await doLogin()) : Promise.reject(`登陆失败: ${e}`);
   } finally {
     console.log('🔚 登录结束');
   }
 }
+
+/**
+ * Token有效性检查
+ * 
+ * 检查缓存的Token是否仍然有效
+ * 1. 检查Token是否存在
+ * 2. 检查Token是否过期（根据TOKEN_CACHE_HOURS配置）
+ * 3. 尝试使用Token获取授权码，验证其有效性
+ * 
+ * @returns {boolean} Token是否有效
+ */
+async function checkTokenValid() {
+  if (!bizrt?.token || !bizrt?.userInfo) {
+    console.log('ℹ️ 无缓存token，需要登录');
+    return false;
+  }
+
+  const savedTime = store.get('95598_token_time');
+  if (savedTime) {
+    const tokenAge = Date.now() - parseInt(savedTime);
+    const cacheHours = parseFloat(process.env.TOKEN_CACHE_HOURS) || 24;
+    const maxAge = cacheHours * 60 * 60 * 1000;
+    if (tokenAge > maxAge) {
+      console.log(`ℹ️ Token已过期（超过${cacheHours}小时），需要重新登录`);
+      store.clear('95598_bizrt');
+      store.clear('95598_token_time');
+      Global.bizrt = {};
+      return false;
+    }
+  }
+
+  console.log('⏳ 尝试使用缓存token...');
+  try {
+    /**
+     * 尝试使用缓存的token获取授权码
+     * 如果成功，说明token有效，同时获取了authorizecode
+     */
+    const e = { url: `/api${$api.getAuth}`, method: 'post', headers: { ...requestKey, token: bizrt.token } };
+    const { redirect_url: o } = await request(e);
+    Global.authorizecode = o.split('?code=')[1];
+    console.log('✅ 缓存token有效');
+    return true;
+  } catch (e) {
+    console.log('⚠️ 缓存token无效:', e);
+    store.clear('95598_bizrt');
+    store.clear('95598_token_time');
+    Global.bizrt = {};
+    return false;
+  }
+}
+
+/**
+ * 步骤3：获取授权码
+ * 
+ * 授权码用于后续获取访问令牌
+ * 这是OAuth2授权流程的一部分
+ */
 async function getAuthcode() {
   console.log('⏳ 获取授权码...');
   try {
-    const e = {
-      url: `/api${$api.getAuth}`,
-      method: 'post',
-      headers: { ...requestKey, token: bizrt.token },
-    },
-      { redirect_url: o } = await request(e);
-    (Global.authorizecode = o.split('?code=')[1]),
-      log.info('✅ 获取授权码成功'),
-      log.debug(`🔑 授权码: ${authorizecode}`);
+    const e = { url: `/api${$api.getAuth}`, method: 'post', headers: { ...requestKey, token: bizrt.token } };
+    const { redirect_url: o } = await request(e);
+    Global.authorizecode = o.split('?code=')[1];
+    log.info('✅ 获取授权码成功');
   } catch (e) {
     return Promise.reject(`获取授权码失败: ${e}`);
   } finally {
     console.log('🔚 获取授权码结束');
   }
 }
+
+/**
+ * 步骤4：获取访问令牌
+ * 
+ * 访问令牌（accessToken）用于后续所有API请求的身份验证
+ */
 async function getAccessToken() {
   console.log('⏳ 获取凭证...');
   try {
-    const e = {
-      url: `/api${$api.getWebToken}`,
-      method: 'post',
-      headers: {
-        ...requestKey,
-        token: bizrt.token,
-        authorizecode: authorizecode,
-      },
-    };
-    (Global.accessToken = await request(e).then(e => e.access_token)),
-      log.info('✅ 获取凭证成功'),
-      log.debug(`🔑 AccessToken: ${accessToken}`);
+    const e = { url: `/api${$api.getWebToken}`, method: 'post', headers: { ...requestKey, token: bizrt.token, authorizecode: authorizecode } };
+    Global.accessToken = await request(e).then(e => e.access_token);
+    log.info('✅ 获取凭证成功');
   } catch (e) {
     return Promise.reject(`获取凭证失败: ${e}`);
   } finally {
     console.log('🔚 获取凭证结束');
   }
 }
+
+/**
+ * 步骤5：查询用户绑定信息
+ * 
+ * 获取用户绑定的电表列表
+ * 一个账号可能绑定多个电表（如家庭、公司等）
+ */
 async function getBindInfo() {
   console.log('⏳ 查询绑定信息...');
   try {
@@ -1420,26 +950,29 @@ async function getBindInfo() {
         serviceCode: $configuration.userInform.serviceCode,
         source: $configuration.source,
         target: $configuration.target,
-        uscInfo: {
-          member: $configuration.uscInfo.member,
-          devciceIp: $configuration.uscInfo.devciceIp,
-          devciceId: $configuration.uscInfo.devciceId,
-          tenant: $configuration.uscInfo.tenant,
-        },
+        uscInfo: { member: $configuration.uscInfo.member, devciceIp: $configuration.uscInfo.devciceIp, devciceId: $configuration.uscInfo.devciceId, tenant: $configuration.uscInfo.tenant },
         quInfo: { userId: bizrt.userInfo[0].userId },
         token: bizrt.token,
         Channels: 'web',
       },
     };
-    (Global.bindInfo = await request(e).then(e => e.bizrt)),
-      log.info('✅ 获取绑定信息成功'),
-      log.debug(`🔑 用户绑定信息: ${jsonStr(bindInfo, null, 2)}`);
+    Global.bindInfo = await request(e).then(e => e.bizrt);
+    log.info('✅ 获取绑定信息成功');
+    log.debug(`🔑 用户绑定信息: ${jsonStr(bindInfo, null, 2)}`);
   } catch (e) {
     return Promise.reject(`获取绑定信息失败: ${e}`);
   } finally {
     console.log('🔚 查询绑定信息结束');
   }
 }
+
+/**
+ * 步骤6：查询电费
+ * 
+ * 获取电费余额、本期用电量等信息
+ * 
+ * @param {number} e - 电表索引（用户可能绑定多个电表）
+ */
 async function getElcFee(e) {
   console.log('⏳ 查询电费...');
   try {
@@ -1460,98 +993,125 @@ async function getElcFee(e) {
             promotType: '1',
             promotCode: '1',
             userAccountId: r.userId,
-            list: [
-              {
-                consNoSrc: o.consNo_dst,
-                proCode: o.proNo,
-                sceneType: o.constType,
-                consNo: o.consNo,
-                orgNo: o.orgNo,
-              },
-            ],
+            list: [{ consNoSrc: o.consNo_dst, proCode: o.proNo, sceneType: o.constType, consNo: o.consNo, orgNo: o.orgNo }],
           },
           serviceCode: '0101143',
           source: $configuration.source,
           target: o.proNo || o.provinceId,
         },
       };
-    (Global.eleBill = await request(s).then(e => e.list[0])),
-      log.info('✅ 查询电费成功'),
-      log.debug(`🔑 电费信息: ${jsonStr(Global.eleBill, null, 2)}`);
+    Global.eleBill = await request(s).then(e => e.list[0]);
+    log.info('✅ 查询电费成功');
+    log.debug(`🔑 电费信息: ${jsonStr(Global.eleBill, null, 2)}`);
   } catch (e) {
     return Promise.reject(`查询电费失败: ${e}`);
   } finally {
     console.log('🔚 查询电费结束');
   }
 }
+
+/**
+ * 步骤7：获取日用电量
+ * 
+ * 获取指定时间范围的每日用电量数据
+ * 支持三种模式：
+ * 1. 默认模式：查询最近7天
+ * 2. 指定天数：通过 QUERY_DAYS 环境变量配置
+ * 3. 指定日期范围：通过 QUERY_START_DATE 和 QUERY_END_DATE 配置
+ * 
+ * 注意：国网API对查询天数有限制，建议不超过30天
+ * 
+ * @param {number} e - 电表索引
+ */
 async function getDayElecQuantity(e) {
   console.log('⏳ 获取日用电量...');
   try {
     const o = bindInfo.powerUserList[e],
-      [r] = bizrt.userInfo,
-      s = getBeforeDate(8),
-      n = getBeforeDate(1),
-      t = {
-        url: `/api${$api.busInfoApi}`,
-        method: 'post',
-        headers: { ...requestKey, token: bizrt.token, acctoken: accessToken },
-        data: {
-          params1: {
-            serviceCode: $configuration.serviceCode,
-            source: $configuration.source,
-            target: $configuration.target,
-            uscInfo: {
-              member: $configuration.uscInfo.member,
-              devciceIp: $configuration.uscInfo.devciceIp,
-              devciceId: $configuration.uscInfo.devciceId,
-              tenant: $configuration.uscInfo.tenant,
-            },
-            quInfo: { userId: r.userId },
-            token: bizrt.token,
-          },
-          params3: {
-            data: {
-              acctId: r.userId,
-              consNo: o.consNo_dst,
-              consType: '02' == o.constType ? '02' : '01',
-              endTime: n,
-              orgNo: o.orgNo,
-              queryYear: new Date().getFullYear().toString(),
-              proCode: o.proNo || o.provinceId,
-              serialNo: '',
-              srvCode: '',
-              startTime: s,
-              userName: r.nickname ? r.nickname : r.loginAccount,
-              funcCode: $configuration.getday.funcCode,
-              channelCode: $configuration.getday.channelCode,
-              clearCache: $configuration.getday.clearCache,
-              promotCode: $configuration.getday.promotCode,
-              promotType: $configuration.getday.promotType,
-            },
-            serviceCode: $configuration.getday.serviceCode,
-            source: $configuration.getday.source,
-            target: o.proNo || o.provinceId,
-          },
-          params4: '010103',
+      [r] = bizrt.userInfo;
+
+    /**
+     * 计算查询时间范围
+     * 优先级：自定义日期 > 指定天数 > 默认7天
+     */
+    let startTime, endTime;
+    const customStartDate = process.env.QUERY_START_DATE;
+    const customEndDate = process.env.QUERY_END_DATE;
+    const queryDays = parseInt(process.env.QUERY_DAYS) || 7;
+
+    if (customStartDate) {
+      startTime = customStartDate;
+      endTime = customEndDate || getBeforeDate(1);
+      console.log(`📅 自定义查询范围: ${startTime} ~ ${endTime}`);
+    } else {
+      startTime = getBeforeDate(queryDays + 1);
+      endTime = getBeforeDate(1);
+      console.log(`📅 查询最近 ${queryDays} 天: ${startTime} ~ ${endTime}`);
+    }
+
+    const t = {
+      url: `/api${$api.busInfoApi}`,
+      method: 'post',
+      headers: { ...requestKey, token: bizrt.token, acctoken: accessToken },
+      data: {
+        params1: {
+          serviceCode: $configuration.serviceCode,
+          source: $configuration.source,
+          target: $configuration.target,
+          uscInfo: { member: $configuration.uscInfo.member, devciceIp: $configuration.uscInfo.devciceIp, devciceId: $configuration.uscInfo.devciceId, tenant: $configuration.uscInfo.tenant },
+          quInfo: { userId: r.userId },
+          token: bizrt.token,
         },
+        params3: {
+          data: {
+            acctId: r.userId,
+            consNo: o.consNo_dst,
+            consType: '02' == o.constType ? '02' : '01',
+            endTime: endTime,
+            orgNo: o.orgNo,
+            queryYear: new Date().getFullYear().toString(),
+            proCode: o.proNo || o.provinceId,
+            serialNo: '',
+            srvCode: '',
+            startTime: startTime,
+            userName: r.nickname ? r.nickname : r.loginAccount,
+            funcCode: $configuration.getday.funcCode,
+            channelCode: $configuration.getday.channelCode,
+            clearCache: $configuration.getday.clearCache,
+            promotCode: $configuration.getday.promotCode,
+            promotType: $configuration.getday.promotType,
+          },
+          serviceCode: $configuration.getday.serviceCode,
+          source: $configuration.getday.source,
+          target: o.proNo || o.provinceId,
+        },
+        params4: '010103',
       },
-      c = await request(t);
-    log.info('✅ 获取日用电量成功'),
-      log.debug(jsonStr(c, null, 2)),
-      (Global.dayElecQuantity = c);
+    };
+    const c = await request(t);
+    log.info('✅ 获取日用电量成功');
+    log.debug(jsonStr(c, null, 2));
+    Global.dayElecQuantity = c;
   } catch (e) {
     return Promise.reject('获取日用电量失败: ' + e);
   } finally {
     console.log('🔚 获取日用电量结束');
   }
 }
+
+/**
+ * 步骤8：获取月用电量
+ * 
+ * 获取最近12个月的月用电量数据
+ * 如果当年数据不足12个月，会自动获取去年的数据补充
+ * 
+ * @param {number} e - 电表索引
+ */
 async function getMonthElecQuantity(e) {
   console.log('⏳ 获取月用电量...');
   const o = bindInfo.powerUserList[e],
     [r] = bizrt.userInfo;
   try {
     let queryYear = new Date().getFullYear().toString();
-    // let queryYear = '2024';
     let e = {
       url: `/api${$api.busInfoApi}`,
       method: 'post',
@@ -1561,12 +1121,7 @@ async function getMonthElecQuantity(e) {
           serviceCode: $configuration.serviceCode,
           source: $configuration.source,
           target: $configuration.target,
-          uscInfo: {
-            member: $configuration.uscInfo.member,
-            devciceIp: $configuration.uscInfo.devciceIp,
-            devciceId: $configuration.uscInfo.devciceId,
-            tenant: $configuration.uscInfo.tenant,
-          },
+          uscInfo: { member: $configuration.uscInfo.member, devciceIp: $configuration.uscInfo.devciceIp, devciceId: $configuration.uscInfo.devciceId, tenant: $configuration.uscInfo.tenant },
           quInfo: { userId: r.userId },
           token: bizrt.token,
         },
@@ -1596,61 +1151,101 @@ async function getMonthElecQuantity(e) {
       },
     };
     const s = await request(e);
+    /**
+     * 如果当年数据不足12个月，获取去年的数据补充
+     */
     if (!s.mothEleList || s.mothEleList.length < 12) {
       queryYear = (new Date().getFullYear() - 1).toString();
       e.data.params3.data.queryYear = queryYear;
       const prevYearData = await request(e);
-      let arr = s.mothEleList || []
+      let arr = s.mothEleList || [];
       s.mothEleList = prevYearData.mothEleList.concat(arr);
     }
-    log.info('✅ 获取月用电量成功'),
-      log.debug(jsonStr(s, null, 2)),
-      (Global.monthElecQuantity = s);
+    log.info('✅ 获取月用电量成功');
+    log.debug(jsonStr(s, null, 2));
+    Global.monthElecQuantity = s;
   } catch (e) {
     return Promise.reject(`获取月用电量失败: ${e}`);
   } finally {
     console.log('🔚 获取月用电量结束');
   }
 }
+
+/**
+ * 登录流程封装
+ * 依次执行：获取验证码 → 登录
+ */
 async function doLogin() {
   const { code: e, ticket: o } = await getVerifyCode();
   await login(o, e);
 }
-async function showNotice() {
-  // console.log(''),
-  //   console.log('1. 本脚本仅用于学习研究，禁止用于商业用途'),
-  //   console.log('2. 本脚本不保证准确性、可靠性、完整性和及时性'),
-  //   console.log('3. 任何个人或组织均可无需经过通知而自由使用'),
-  //   console.log('4. 作者对任何脚本问题概不负责，包括由此产生的任何损失'),
-  //   console.log(
-  //     '5. 如果任何单位或个人认为该脚本可能涉嫌侵犯其权利，应及时通知并提供身份证明、所有权证明，我将在收到认证文件确认后删除'
-  //   ),
-  //   console.log('6. 请勿将本脚本用于商业用途，由此引起的问题与作者无关'),
-  //   console.log('7. 本脚本及其更新版权归作者所有'),
-  console.log('');
-}
-function formatDate(dateStr) {
-  // 分割日期字符串
-  var year = dateStr.substring(0, 4);
-  var month = dateStr.substring(4, 6);
-  var day = dateStr.substring(6, 8);
 
-  // 返回格式化的日期字符串
+/**
+ * 日期格式化函数
+ * 将 YYYYMMDD 格式转换为 YYYY-MM-DD 格式
+ * 
+ * @param {string} dateStr - 原始日期字符串
+ * @returns {string} 格式化后的日期字符串
+ */
+function formatDate(dateStr) {
+  const year = dateStr.substring(0, 4);
+  const month = dateStr.substring(4, 6);
+  const day = dateStr.substring(6, 8);
   return year + '-' + month + (day ? '-' + day : '');
 }
-// 修改发送mqtt消息至homeassistant
+
+/**
+ * 步骤9：发送数据到MQTT
+ * 
+ * 将获取到的电费数据通过MQTT推送到Home Assistant
+ * 
+ * 数据格式：
+ * {
+ *   consNo: "户号",
+ *   sumMoney: "账户余额",
+ *   totalPq: "本期用电量",
+ *   date: "截至日期",
+ *   dayList: [...],    // 日用电量列表
+ *   monthList: [...],  // 月用电量列表
+ *   totalEleNum: "年度用电量",
+ *   totalEleCost: "年度电费"
+ * }
+ * 
+ * @param {string} e - 脚本名称
+ * @param {Object} eleBill - 电费信息
+ * @param {Array} dayList - 日用电量列表
+ * @param {Object} monthElecQuantity - 月用电量数据
+ */
 async function sendMsg(e, eleBill, dayList, monthElecQuantity) {
-  const host =
-    (isNode() ? process.env.WSGW_mqtt_host : store.get('95598_mqtt_host')) || '',
-    port =
-      (isNode() ? process.env.WSGW_mqtt_port : store.get('95598_mqtt_port')) || '',
-    mqtt_username = (isNode() ? process.env.WSGW_mqtt_username : store.get('95598_mqtt_username')) || '',
-    mqtt_password = (isNode() ? process.env.WSGW_mqtt_password : store.get('95598_mqtt_password')) || '';
+  const mqttEnabled = isTrue(process.env.MQTT_ENABLED);
+  const host = process.env.WSGW_mqtt_host || '',
+    port = process.env.WSGW_mqtt_port || '',
+    mqtt_username = process.env.WSGW_mqtt_username || '',
+    mqtt_password = process.env.WSGW_mqtt_password || '';
 
-  const mqtt = require('mqtt')
-  const clientId = 'mqtt_qldocker'
+  /**
+   * 先保存历史数据到本地
+   * 即使MQTT禁用，也会保存历史数据
+   */
+  historyManager.save({ dayList, monthList: monthElecQuantity.mothEleList || [] }, eleBill.consNo);
 
-  const connectUrl = `mqtt://${host}:${port}`
+  if (!mqttEnabled) {
+    console.log('ℹ️ MQTT已禁用，跳过发送');
+    return;
+  }
+
+  if (!host) {
+    console.log('⚠️ MQTT地址未配置，跳过发送');
+    return;
+  }
+
+  const mqtt = require('mqtt');
+  const clientId = 'mqtt_state_grid_' + Date.now();
+  const connectUrl = `mqtt://${host}:${port}`;
+
+  /**
+   * 连接MQTT服务器
+   */
   const client = mqtt.connect(connectUrl, {
     clientId,
     clean: true,
@@ -1658,116 +1253,173 @@ async function sendMsg(e, eleBill, dayList, monthElecQuantity) {
     username: mqtt_username,
     password: mqtt_password,
     reconnectPeriod: 1000,
-  })
+  });
 
-  const topic = 'nodejs/state-grid/' + eleBill.consNo
-  let data = eleBill;
-  dayList = dayList.filter(val => {
-    return val.dayElePq != '-'
-  }).map(val => {
-    val.day = formatDate(val.day)
-    return val
-  })
-  let monthList = []
+  /**
+   * MQTT主题：nodejs/state-grid/{用电户号}
+   * Home Assistant 订阅此主题获取数据
+   */
+  const topic = 'nodejs/state-grid/' + eleBill.consNo;
+  let data = { ...eleBill };
+
+  /**
+   * 格式化日用电数据
+   * - 过滤无效数据
+   * - 转换日期格式
+   */
+  dayList = dayList.filter(val => val.dayElePq != '-').map(val => {
+    val.day = formatDate(val.day);
+    return val;
+  });
+
+  /**
+   * 格式化月用电数据
+   */
+  let monthList = [];
   if (monthElecQuantity.mothEleList) {
     monthList = monthElecQuantity.mothEleList.map(val => {
-      val.month = formatDate(val.month)
-      return val
-    })
+      val.month = formatDate(val.month);
+      return val;
+    });
   }
 
+  /**
+   * 组装最终数据
+   */
   data.dayList = dayList;
   data.monthList = monthList;
   data.totalEleNum = monthElecQuantity?.dataInfo?.totalEleNum || 0;
   data.totalEleCost = monthElecQuantity?.dataInfo?.totalEleCost || 0;
+
+  /**
+   * 发布消息到MQTT
+   * 使用 retain: true 确保新订阅者能立即获取最新数据
+   */
   client.on('connect', () => {
-    console.log('mqtt:Connected')
-    //   console.log(data)
-    client.publish(topic, JSON.stringify(data), { qos: 0, retain: true }, (error) => {
+    console.log('mqtt:Connected');
+    client.publish(topic, JSON.stringify(data), { qos: 0, retain: true }, error => {
       if (error) {
-        console.error(error)
+        console.error(error);
       } else {
-        console.log('mqtt:Published')
+        console.log('mqtt:Published');
       }
-    })
-  })
-
-  setTimeout(() => {
-    client.end()
-  }, 2000)
-
-  await new Promise((resolve, reject) => {
-    setTimeout(() => resolve("done!"), 2000)
+    });
   });
+
+  setTimeout(() => client.end(), 2000);
+
+  await new Promise(resolve => setTimeout(() => resolve('done!'), 2000));
 }
-// async function sendMsg(e, o, r, s) {
-//   const n = s?.['open-url'] || s?.openUrl || s?.$open || s?.url,
-//     t = s?.['media-url'] || s?.mediaUrl || s?.$media;
-//   isNode()
-//     ? ((r += n ? `\n点击跳转: ${n}` : ''),
-//       (r += t ? `\n多媒体: ${t}` : ''),
-//       console.log(`${e}\n${o}\n${r}\n`),
-//       await Notify.sendNotify(`${e}\n${o}`, r))
-//     : notify(e, o, r, s);
-// }
+
+/**
+ * 显示运行信息
+ */
+async function showNotice() {
+  console.log('');
+  console.log(`运行模式: ${isQinglong ? '青龙面板' : '独立运行'}`);
+}
+
+/******************************************
+ * 第十二部分：主程序入口
+ * 
+ * 脚本的主要执行流程
+ ******************************************/
+
 (async () => {
-  if ((await showNotice(), !USERNAME || !PASSWORD))
-    return sendMsg(
-      SCRIPTNAME,
-      '请先配置网上国网账号密码!',
-      '点击前往BoxJs配置',
-      {
-        'open-url':
-          'http://boxjs.com/#/sub/add/https%3A%2F%2Fraw.githubusercontent.com%2FYuheng0101%2FX%2Fmain%2FTasks%2Fboxjs.json',
-      }
+  /**
+   * 检查账号密码是否配置
+   */
+  if ((await showNotice(), !USERNAME || !PASSWORD)) {
+    console.log('❌ 请先配置网上国网账号密码!');
+    console.log('独立运行: 复制 config.env.example 为 config.env 并配置');
+    console.log('青龙面板: 设置环境变量 WSGW_USERNAME 和 WSGW_PASSWORD');
+    return;
+  }
+
+  /**
+   * 主流程：
+   * 1. 获取加密密钥
+   * 2. 检查Token有效性（有效则跳过登录）
+   * 3. 获取访问令牌
+   * 4. 查询绑定信息
+   * 5. 遍历每个电表，获取数据并发送
+   */
+  await getKeyCode();
+  const tokenValid = await checkTokenValid();
+  if (!tokenValid) {
+    await doLogin();
+    await getAuthcode();
+  }
+  await getAccessToken();
+  await getBindInfo();
+
+  /**
+   * 根据配置筛选要查询的电表
+   * 支持指定户号查询，多个户号用逗号分隔
+   */
+  const queryConsNo = process.env.QUERY_CONS_NO || '';
+  let targetUserList = bindInfo.powerUserList;
+
+  if (queryConsNo) {
+    const consNoList = queryConsNo.split(',').map(s => s.trim()).filter(s => s);
+    targetUserList = bindInfo.powerUserList.filter(user =>
+      consNoList.includes(user.consNo) || consNoList.includes(user.consNo_dst)
     );
-  await getKeyCode(),
-    (bizrt?.token && bizrt?.userInfo) || (await doLogin()),
-    await getAuthcode(),
-    await getAccessToken(),
-    await getBindInfo();
-  for (let e = 0; e < bindInfo.powerUserList.length; e++) {
-    await getElcFee(e),
-      await getDayElecQuantity(e),
-      await getMonthElecQuantity(e);
-    const o = bindInfo.powerUserList[e],
+    console.log(`📋 指定查询户号: ${consNoList.join(', ')}`);
+    console.log(`📋 匹配到 ${targetUserList.length} 个电表`);
+
+    if (targetUserList.length === 0) {
+      console.log('⚠️ 未找到匹配的电表，将查询所有绑定的电表');
+      targetUserList = bindInfo.powerUserList;
+    }
+  }
+
+  /**
+   * 遍历用户绑定的所有电表
+   * 依次获取每个电表的数据
+   */
+  for (let e = 0; e < targetUserList.length; e++) {
+    const originalIndex = bindInfo.powerUserList.indexOf(targetUserList[e]);
+    await getElcFee(originalIndex);
+    await getDayElecQuantity(originalIndex);
+    await getMonthElecQuantity(originalIndex);
+
+    /**
+     * 组装输出信息
+     */
+    const o = targetUserList[e],
       { dataInfo: r } = monthElecQuantity,
-      { sevenEleList: s, totalPq: n } = dayElecQuantity,
-      t =
-        Number(eleBill?.historyOwe || '0') > 0 ||
-        Number(eleBill?.sumMoney || '0') < 0;
-    let c = Math.abs(eleBill?.sumMoney || '0');
-    c = t ? `-${c}` : c;
+      { sevenEleList: s, totalPq: n } = dayElecQuantity;
     let a = '';
-    eleBill.totalPq && (a += `本期电量: ${eleBill.totalPq}度`),
-      eleBill.sumMoney && (a += `  账户余额: ${c}元`),
-      (a += `\n截至日期: ${eleBill.date}`),
-      r &&
-      r.totalEleNum &&
-      r.totalEleCost &&
-      (a += `\n年度用电: ${r.totalEleNum}度  累计花费: ${r.totalEleCost}元`),
-      isTrue(SHOW_RECENT) ||
-      (eleBill.dayNum
-        ? (a += `\n预计可用: ${eleBill.dayNum}天`)
-        : eleBill.prepayBal && (a += `\n预存电费: ${eleBill.prepayBal}元`)),
-      o.consNo_dst &&
-      (a += `\n户号信息: ${o.consNo_dst}${o.consName_dst ? `|${o.consName_dst}` : ''
-        }`),
-      o.orgName && (a += `\n供电单位: ${o.orgName}`),
-      o.elecAddr_dst && (a += `\n用电地址: ${o.elecAddr_dst}`),
-      n && (a += `\n五日用电: ${n}度`),
-      isTrue(SHOW_RECENT) &&
+    eleBill.totalPq && (a += `本期电量: ${eleBill.totalPq}度`);
+    eleBill.sumMoney && (a += `  账户余额: ${eleBill.sumMoney}元`);
+    a += `\n截至日期: ${eleBill.date}`;
+    r && r.totalEleNum && r.totalEleCost && (a += `\n年度用电: ${r.totalEleNum}度  累计花费: ${r.totalEleCost}元`);
+    o.consNo_dst && (a += `\n户号信息: ${o.consNo_dst}${o.consName_dst ? `|${o.consName_dst}` : ''}`);
+    o.orgName && (a += `\n供电单位: ${o.orgName}`);
+    n && (a += `\n五日用电: ${n}度`);
+
+    /**
+     * 可选：显示最近每日用电详情
+     */
+    isTrue(SHOW_RECENT) &&
       s.forEach((e, o) => {
         Number(e.dayElePq) && (a += `\n${e.day}用电: ${e.dayElePq}度⚡`);
-      }),
-      // console.log(monthElecQuantity)
-      // await sendMsg(SCRIPTNAME, '', a);
-      await sendMsg(SCRIPTNAME, eleBill, s, monthElecQuantity);
+      });
+
+    /**
+     * 发送数据到MQTT
+     */
+    await sendMsg(SCRIPTNAME, eleBill, s, monthElecQuantity);
   }
+  console.log('✅ 执行完成');
 })()
   .catch(e => {
-    /无效|失效|过期|重新获取|请求异常/.test(e) &&
-      (store.clear('95598_bizrt'), console.log('✅ 清理缓存数据成功')),
-      log.error(e);
+    /**
+     * 错误处理
+     * 如果遇到Token相关错误，清除缓存
+     */
+    /无效|失效|过期|重新获取|请求异常/.test(e) && (store.clear('95598_bizrt'), console.log('✅ 清理缓存数据成功'));
+    log.error(e);
   })
   .finally(done);

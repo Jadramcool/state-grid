@@ -1,0 +1,29 @@
+{
+  "name": "state-grid",
+  "version": "2.0.0",
+  "description": "网上国网电力信息获取脚本 - 支持独立运行和青龙面板",
+  "main": "state-grid-multiple.js",
+  "scripts": {
+    "start": "node state-grid-multiple.js",
+    "start:single": "node state-grid.js",
+    "test": "node state-grid-multiple.js"
+  },
+  "keywords": [
+    "state-grid",
+    "electricity",
+    "homeassistant",
+    "qinglong"
+  ],
+  "author": "Yuheng",
+  "license": "MIT",
+  "dependencies": {
+    "mqtt": "^4.3.7",
+    "got": "^11.8.6",
+    "iconv-lite": "^0.6.3",
+    "dotenv": "^16.3.1",
+    "node-localstorage": "^2.2.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
