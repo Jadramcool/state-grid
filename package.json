@@ -14,7 +14,7 @@
     "homeassistant",
     "qinglong"
   ],
-  "author": "Yuheng",
+  "author": "Jadramcool",
   "license": "MIT",
   "dependencies": {
     "mqtt": "^4.3.7",

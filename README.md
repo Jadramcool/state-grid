@@ -2,7 +2,7 @@
 
 国家电网用电信息获取脚本，支持独立运行和青龙面板，配合 MQTT 在 Home Assistant 中统计用电数据。
 
-> 🙏 **感谢原作者 [Yuheng](https://github.com/x2rr) 提供的原始脚本！**
+> 🙏 **感谢原作者 [x2rr](https://github.com/x2rr) 提供的原始脚本！**
 >
 > 本项目基于 [state-grid](https://github.com/x2rr/state-grid) 进行二次开发，增加了以下功能：
 > - ✅ 支持独立运行（脱离青龙面板）
@@ -344,7 +344,8 @@ state-grid/
 
 ## 致谢
 
-- 原作者 [Yuheng](https://github.com/x2rr) - [state-grid](https://github.com/x2rr/state-grid)
+- 原作者 [Yuheng0101](https://github.com/Yuheng0101) - [state-grid](https://github.com/Yuheng0101/X)
+- 原作者 [x2rr](https://github.com/x2rr) - [state-grid](https://github.com/x2rr/state-grid)
 - 中转服务器 API 提供者
 
 ---
